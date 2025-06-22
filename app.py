@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Nom du fichier : app.py (Version Finale pour Déploiement)
-Description : Version finale de l'application Streamlit.
-              - Gestion sécurisée de la clé API pour le déploiement.
-              - Interface interactive avec sliders pour les paramètres.
-              - Logique de détection robuste avec plans de secours.
-              - Gestion du cache corrigée et optimisée avec @st.cache_data.
+Nom du fichier : app_v2.py
+Description : Application web de démonstration V2 pour le traitement d'iris avancé.
+              Interface à onglets, options interactives, et pipeline modulaire.
 """
 import streamlit as st
 import cv2
@@ -17,27 +14,29 @@ import os
 import tempfile
 import io
 
-# --- CONFIGURATION SÉCURISÉE ---
+# --- CONFIGURATION ET CONSTANTES ---
+st.set_page_config(page_title="Démo Traitement d'Iris V2", layout="wide")
+
 try:
     ROBOFLOW_API_KEY = st.secrets["ROBOFLOW_API_KEY"]
 except (FileNotFoundError, KeyError):
-    st.warning("Clé API Roboflow non trouvée dans les secrets. L'application pourrait ne pas fonctionner après déploiement.")
-    ROBOFLOW_API_KEY = "VOTRE_CLE_API_POUR_TEST_LOCAL" 
+    st.warning("Clé API Roboflow non trouvée. Utilisation d'une clé de secours pour la démo.")
+    ROBOFLOW_API_KEY = "JQUGRc1I81vEziqzrvaw" 
 
 PROJET_IRIS = "iris-segmentation-fqgey"
 VERSION_IRIS = 5
 PROJET_SCLERE = "conuhacks-eye-model-own"
 VERSION_SCLERE = 1
+CONFIDENCE_THRESHOLD = 0.2
 
 # ==============================================================================
-# /// LOGIQUE BACKEND (PIPELINE DE TRAITEMENT D'IMAGE) ///
+# /// LOGIQUE BACKEND (PIPELINE DE TRAITEMENT D'IMAGE MODULAIRE) ///
 # ==============================================================================
 
 @st.cache_resource
 def charger_modeles():
-    """Charge les deux modèles IA depuis Roboflow et les met en cache."""
-    if "VOTRE_CLE_API" in ROBOFLOW_API_KEY:
-        return "ERREUR_CLE_API", None
+    """Charge les modèles IA et les met en cache pour toute la session."""
+    if "VOTRE_CLE_API" in ROBOFLOW_API_KEY: return "ERREUR_CLE_API", None
     try:
         rf = Roboflow(api_key=ROBOFLOW_API_KEY)
         model_iris = rf.workspace().project(PROJET_IRIS).version(VERSION_IRIS).model
@@ -46,150 +45,224 @@ def charger_modeles():
     except Exception as e:
         return f"Erreur de connexion à Roboflow : {e}", None
 
-def get_predictions_from_model(model, image_path, confidence_threshold):
-    """Appelle un modèle et retourne les prédictions filtrées."""
-    try:
-        result = model.predict(image_path, confidence=confidence_threshold * 100).json()
-        return [p for p in result.get('predictions', []) if p.get('confidence', 0) > confidence_threshold]
-    except Exception as e:
-        print(f"Avertissement: Erreur lors de l'appel au modèle: {e}")
-        return []
-
-def create_cleaned_mask_from_preds(preds, image_shape):
-    """Crée un masque nettoyé à partir de la plus grande prédiction."""
-    h, w = image_shape[:2]
-    if not preds: return None
-    preds.sort(key=lambda p: p['width'] * p['height'], reverse=True)
-    mask = np.zeros((h, w), dtype=np.uint8)
-    contour = np.array([[pt['x'], pt['y']] for pt in preds[0]['points']], dtype=np.int32)
-    cv2.fillPoly(mask, [contour], 255)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-# --- CORRECTION : Ajout de @st.cache_data et renommage des arguments ---
 @st.cache_data
-def process_iris_image(image_oeil_bytes, image_texture_bytes, confidence_threshold, transparency_level):
+def detect_and_mask(_image_bytes):
     """
-    Pipeline de traitement principal. Mis en cache par Streamlit.
-    Ne sera ré-exécuté que si un des arguments change.
+    Étape 1 du pipeline : Détection et création des masques de base.
+    Prend les bytes de l'image pour être compatible avec le cache de Streamlit.
     """
     log = []
-    temp_eye_file_path = None
+    image_pil = Image.open(io.BytesIO(_image_bytes)).convert("RGB")
+    image_source = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
+    h, w = image_source.shape[:2]
+
+    model_iris, model_sclere = charger_modeles()
+    if model_sclere is None:
+        return {"erreur": model_iris}
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_f:
+        image_pil.save(temp_f.name, "JPEG")
+        temp_file_path = temp_f.name
     
-    # On convertit les bytes en objet PIL ici, à l'intérieur de la fonction cachée
-    image_oeil_pil = Image.open(io.BytesIO(image_oeil_bytes)).convert("RGB")
-    image_texture_pil = Image.open(io.BytesIO(image_texture_bytes)).convert("RGB")
-
     try:
-        log.append("Chargement des modèles d'IA (depuis le cache si possible)...")
-        model_iris, model_sclere = charger_modeles()
-        if model_sclere is None:
-            log.append(model_iris)
-            return None, log
-
-        log.append("Création d'un fichier temporaire...")
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_f:
-            image_oeil_pil.save(temp_f.name, "JPEG")
-            temp_eye_file_path = temp_f.name
+        log.append("Analyse par le modèle d'iris...")
+        preds_iris = model_iris.predict(temp_file_path, confidence=CONFIDENCE_THRESHOLD * 100).json().get('predictions', [])
+        log.append(f"-> Trouvé {len(preds_iris)} objets.")
         
-        image_oeil_source = cv2.cvtColor(np.array(image_oeil_pil), cv2.COLOR_RGB2BGR)
-        image_texture = cv2.cvtColor(np.array(image_texture_pil), cv2.COLOR_RGB2BGR)
-        h, w = image_oeil_source.shape[:2]
+        log.append("Analyse par le modèle de sclère...")
+        preds_sclere = model_sclere.predict(temp_file_path, confidence=CONFIDENCE_THRESHOLD * 100).json().get('predictions', [])
+        log.append(f"-> Trouvé {len(preds_sclere)} objets.")
 
-        log.append(f"Étape 1 : Détection avec seuil à {confidence_threshold:.3f}...")
-        preds_iris = get_predictions_from_model(model_iris, temp_eye_file_path, confidence_threshold)
-        preds_sclere = get_predictions_from_model(model_sclere, temp_eye_file_path, confidence_threshold)
+        if not preds_iris: return {"erreur": "Le modèle d'iris n'a retourné aucune détection fiable."}
+
+        # Logique de consensus
+        masque_iris_brut = np.zeros((h, w), dtype=np.uint8)
+        preds_iris.sort(key=lambda p: p['width'] * p['height'], reverse=True)
+        cv2.fillPoly(masque_iris_brut, [np.array([[pt['x'], pt['y']] for pt in preds_iris[0]['points']], dtype=np.int32)], 255)
         
-        # ... la logique de fallback reste identique ...
-        masque_oeil_final = None
-        if preds_iris and preds_sclere:
-            masque_vote_iris = create_cleaned_mask_from_preds(preds_iris, (h,w))
-            masque_vote_sclere = create_cleaned_mask_from_preds(preds_sclere, (h,w))
-            if masque_vote_iris is not None and masque_vote_sclere is not None:
-                masque_oeil_final = cv2.bitwise_and(masque_vote_iris, cv2.bitwise_not(masque_vote_sclere))
+        masque_oeil_final = masque_iris_brut
+        if preds_sclere:
+            masque_sclere = np.zeros((h, w), dtype=np.uint8)
+            preds_sclere.sort(key=lambda p: p['width'] * p['height'], reverse=True)
+            cv2.fillPoly(masque_sclere, [np.array([[pt['x'], pt['y']] for pt in preds_sclere[0]['points']], dtype=np.int32)], 255)
+            masque_oeil_final = cv2.bitwise_and(masque_iris_brut, cv2.bitwise_not(masque_sclere))
+            log.append("Consensus appliqué.")
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        masque_oeil_final = cv2.morphologyEx(masque_oeil_final, cv2.MORPH_OPEN, kernel)
         
-        if masque_oeil_final is None or np.sum(masque_oeil_final) == 0:
-            if preds_iris: masque_oeil_final = create_cleaned_mask_from_preds(preds_iris, (h,w))
+        if np.sum(masque_oeil_final) == 0: return {"erreur": "Le consensus des modèles n'a produit aucun masque."}
 
-        if masque_oeil_final is None or np.sum(masque_oeil_final) == 0:
-             if preds_sclere:
-                masque_sclere = create_cleaned_mask_from_preds(preds_sclere, (h,w))
-                if masque_sclere is not None:
-                    contours, _ = cv2.findContours(cv2.bitwise_not(masque_sclere), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if contours:
-                        masque_oeil_final = np.zeros((h, w), dtype=np.uint8)
-                        cv2.drawContours(masque_oeil_final, [max(contours, key=cv2.contourArea)], -1, 255, -1)
-
-        if masque_oeil_final is None or np.sum(masque_oeil_final) == 0:
-            log.append("ERREUR : Aucune stratégie n'a pu produire un masque valide.")
-            return None, log
-
-        # ... la suite de la logique est inchangée ...
         masque_pupille = np.zeros((h, w), dtype=np.uint8)
-        masque_iris_annulus = masque_oeil_final
         if len(preds_iris) >= 2:
-            preds_iris.sort(key=lambda p: p['width'] * p['height'], reverse=True)
             contour_pupille = np.array([[pt['x'], pt['y']] for pt in preds_iris[1]['points']], dtype=np.int32)
             if len(contour_pupille) >= 5:
                 cv2.ellipse(masque_pupille, cv2.fitEllipse(contour_pupille), 255, -1)
-                masque_iris_annulus = cv2.bitwise_and(masque_oeil_final, cv2.bitwise_not(masque_pupille))
-
-        log.append("Étape 3 : Composition et effet artistique...")
-        texture_redimensionnee = cv2.resize(image_texture, (w, h))
-        iris_original = cv2.bitwise_and(image_oeil_source, image_oeil_source, mask=masque_iris_annulus)
-        texture_isolee = cv2.bitwise_and(texture_redimensionnee, texture_redimensionnee, mask=masque_iris_annulus)
-        iris_texture_transparente = cv2.addWeighted(iris_original, 1 - transparency_level, texture_isolee, transparency_level, 0)
-        fond_troue = cv2.bitwise_and(image_oeil_source, image_oeil_source, mask=cv2.bitwise_not(masque_oeil_final))
-        pupille_originale = cv2.bitwise_and(image_oeil_source, image_oeil_source, mask=masque_pupille)
-        nouvel_oeil = cv2.add(iris_texture_transparente, pupille_originale)
-        image_finale_bgr = cv2.add(fond_troue, nouvel_oeil)
         
-        image_finale_rgb = cv2.cvtColor(image_finale_bgr, cv2.COLOR_BGR2RGB)
-        log.append("Traitement terminé avec succès !")
-        return image_finale_rgb, log
+        masque_iris_annulus = cv2.bitwise_and(masque_oeil_final, cv2.bitwise_not(masque_pupille))
 
+        return {
+            "image_source": image_source,
+            "masque_global": masque_oeil_final,
+            "masque_annulus": masque_iris_annulus,
+            "masque_pupille": masque_pupille,
+            "log": log
+        }
     finally:
-        if temp_eye_file_path and os.path.exists(temp_eye_file_path):
-            os.remove(temp_eye_file_path)
+        os.remove(temp_file_path)
+
+def remove_reflections(image, iris_mask):
+    """Étape 2a : Suppression des reflets par inpainting."""
+    reflections_mask = cv2.inRange(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 220, 255)
+    reflections_on_iris = cv2.bitwise_and(reflections_mask, iris_mask)
+    return cv2.inpaint(image, reflections_on_iris, 3, cv2.INPAINT_NS)
+
+def enhance_texture(image):
+    """Étape 2b : Amélioration de la texture par Unsharp Masking."""
+    gaussian = cv2.GaussianBlur(image, (0,0), 5.0)
+    return cv2.addWeighted(image, 1.8, gaussian, -0.8, 0)
+
+def apply_artistic_effect(base_image, effect, texture_image=None):
+    """Étape 3 : Applique l'effet artistique sélectionné."""
+    if effect == "Aucun":
+        return base_image
+    elif effect == "Texture Galaxie" or effect == "Texture Feu":
+        texture = cv2.imread(f"textures/{effect.split(' ')[1].lower()}.jpg")
+    elif effect == "Texture Personnalisée" and texture_image is not None:
+        texture = cv2.cvtColor(np.array(texture_image), cv2.COLOR_RGB2BGR)
+    else:
+        return base_image
+
+    h, w = base_image.shape[:2]
+    texture = cv2.resize(texture, (w, h))
+    
+    # Superposer la texture sur l'iris
+    return cv2.addWeighted(base_image, 0.5, texture, 0.5, 0)
+
 
 # ==============================================================================
 # /// INTERFACE UTILISATEUR (STREAMLIT) ///
 # ==============================================================================
 
-st.set_page_config(page_title="Démo Traitement d'Iris", layout="wide")
-st.title("Démonstration de Traitement Artistique d'Iris")
+st.title("IRIS V2 : Démonstration de Traitement Avancé")
 
+# --- BARRE LATERALE ---
 with st.sidebar:
-    st.header("1. Paramètres")
-    confidence_slider = st.slider("Seuil de Confiance IA", 0.01, 0.99, 0.1, 0.01)
-    transparency_slider = st.slider("Opacité de la Texture", 0.0, 1.0, 0.45, 0.05)
-    st.header("2. Fichiers")
-    uploaded_eye_file = st.file_uploader("Image de l'œil", type=['jpg', 'jpeg', 'png', 'webp', 'jfif'])
-    uploaded_texture_file = st.file_uploader("Image de Texture", type=['jpg', 'jpeg', 'png', 'webp', 'jfif'])
+    st.header("Image Source")
+    uploaded_eye_file = st.file_uploader("Téléversez une photo d'œil", type=['jpg', 'jpeg', 'png', 'webp', 'jfif'])
+    
+    if uploaded_eye_file:
+        st.image(uploaded_eye_file, caption="Image Originale")
 
-if uploaded_eye_file and uploaded_texture_file:
-    if st.button("Lancer le Traitement", type="primary", use_container_width=True):
-        eye_bytes = uploaded_eye_file.getvalue()
-        texture_bytes = uploaded_texture_file.getvalue()
+# --- GESTION DES ONGLETS ---
+if uploaded_eye_file:
+    # Lancer la détection une seule fois et stocker les résultats dans la session
+    if "results" not in st.session_state or st.session_state.get("file_id") != uploaded_eye_file.id:
+        st.session_state.file_id = uploaded_eye_file.id
+        with st.spinner("Analyse IA en cours... Cette étape peut prendre un moment."):
+            st.session_state.results = detect_and_mask(uploaded_eye_file.getvalue())
+
+    # Vérifier si la détection a échoué
+    if "erreur" in st.session_state.results:
+        st.error(f"La détection initiale a échoué : {st.session_state.results['erreur']}")
+        with st.expander("Voir le journal de détection"):
+            st.write(st.session_state.results.get('log', []))
+    else:
+        # Si la détection a réussi, afficher les onglets
+        tab1, tab2, tab3, tab4 = st.tabs(["Étape 1: Masquage", "Étape 2: Amélioration", "Étape 3: Effets", "Résultat Final"])
+
+        # Extraire les résultats de base
+        res = st.session_state.results
+        image_source = res['image_source']
+        masque_annulus = res['masque_annulus']
+        masque_pupille = res['masque_pupille']
+        masque_global = res['masque_global']
         
-        with st.spinner("Analyse en cours par l'IA..."):
-            # On passe les bytes à la fonction cachée
-            final_image, log = process_iris_image(eye_bytes, texture_bytes, confidence_slider, transparency_slider)
-        
-        if final_image is None:
-            st.error("Le traitement a échoué.")
-        else:
-            st.success("Traitement réussi !")
-            st.subheader("Comparaison Avant / Après")
+        # --- Onglet 1: Masquage ---
+        with tab1:
+            st.header("Détection et Détourage Précis par IA")
+            st.info("Le contour vert a été généré par un consensus de deux modèles IA pour épouser la forme réelle de l'iris.")
+            
             col1, col2 = st.columns(2)
             with col1:
-                st.image(eye_bytes, caption="Image Originale", use_column_width=True)
+                # Afficher le contour sur l'image
+                contours, _ = cv2.findContours(masque_annulus, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                img_contour = image_source.copy()
+                cv2.drawContours(img_contour, contours, -1, (0, 255, 0), 2)
+                st.image(cv2.cvtColor(img_contour, cv2.COLOR_BGR2RGB), caption="Contour de l'Iris Détecté")
             with col2:
-                st.image(final_image, caption="Résultat Final", use_column_width=True)
+                # Afficher l'iris isolé sur fond transparent
+                b, g, r = cv2.split(image_source)
+                iris_isole_bgra = cv2.merge([b, g, r, masque_annulus])
+                st.image(iris_isole_bgra, caption="Iris Isolé (fond transparent)")
 
-        with st.expander("Afficher le journal de traitement"):
-            for entry in log:
-                if "ERREUR" in entry or "Échec" in entry: st.error(entry)
-                else: st.info(entry)
+        # --- Onglet 2: Amélioration ---
+        with tab2:
+            st.header("Nettoyage et Amélioration de la Texture")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("Cochez les options pour voir leur effet :")
+                do_reflect_removal = st.checkbox("Supprimer les reflets lumineux")
+                do_texture_enhance = st.checkbox("Améliorer la texture (netteté)")
+            
+            # Traiter l'image en fonction des choix
+            iris_isole_bgr = cv2.bitwise_and(image_source, image_source, mask=masque_annulus)
+            processed_image = iris_isole_bgr.copy()
+            if do_reflect_removal:
+                processed_image = remove_reflections(processed_image, masque_annulus)
+            if do_texture_enhance:
+                processed_image = enhance_texture(processed_image)
+
+            with col2:
+                st.image(cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB), caption="Iris amélioré")
+            
+            # Sauvegarder l'état pour l'onglet suivant
+            st.session_state.enhanced_iris = processed_image
+
+        # --- Onglet 3: Effets Artistiques ---
+        with tab3:
+            st.header("Application d'Effets Artistiques")
+            
+            # Utiliser l'image améliorée de l'étape précédente
+            enhanced_iris = st.session_state.get('enhanced_iris', cv2.bitwise_and(image_source, image_source, mask=masque_annulus))
+
+            effect_choice = st.selectbox("Choisissez un effet :", ["Aucun", "Texture Galaxie", "Texture Feu", "Texture Personnalisée"])
+            
+            texture_pil = None
+            if effect_choice == "Texture Personnalisée":
+                uploaded_texture_file = st.file_uploader("Téléversez votre propre texture", type=['jpg', 'jpeg', 'png'])
+                if uploaded_texture_file:
+                    texture_pil = Image.open(uploaded_texture_file).convert("RGB")
+            
+            artistic_iris = apply_artistic_effect(enhanced_iris, effect_choice, texture_pil)
+            st.image(cv2.cvtColor(artistic_iris, cv2.COLOR_BGR2RGB), caption=f"Iris avec effet '{effect_choice}'")
+
+            # Sauvegarder pour l'onglet final
+            st.session_state.artistic_iris = artistic_iris
+
+        # --- Onglet 4: Résultat Final ---
+        with tab4:
+            st.header("Composition Finale")
+            
+            # Utiliser l'image de l'étape précédente
+            artistic_iris = st.session_state.get('artistic_iris', cv2.bitwise_and(image_source, image_source, mask=masque_annulus))
+            
+            # Assemblage
+            fond_troue = cv2.bitwise_and(image_source, image_source, mask=cv2.bitwise_not(masque_global))
+            pupille_originale = cv2.bitwise_and(image_source, image_source, mask=masque_pupille)
+            nouvel_oeil = cv2.add(artistic_iris, pupille_originale)
+            image_finale = cv2.add(fond_troue, nouvel_oeil)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.image(cv2.cvtColor(image_source, cv2.COLOR_BGR2RGB), caption="Image Originale")
+            with col2:
+                st.image(cv2.cvtColor(image_finale, cv2.COLOR_BGR2RGB), caption="Résultat Final Intégré")
+
+            # Bouton de téléchargement
+            result_as_bytes = cv2.imencode('.png', cv2.cvtColor(image_finale, cv2.COLOR_BGR2RGB))[1].tobytes()
+            st.download_button("Télécharger le Résultat Final", result_as_bytes, "iris_final.png", "image/png")
+
 else:
-    st.info("Veuillez téléverser une image de l'œil et une image de texture pour commencer.")
+    st.info("👋 Bienvenue ! Veuillez téléverser une photo d'œil dans la barre latérale pour commencer la démonstration.")
